@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/emersion/go-smtp"
 )
@@ -122,6 +123,43 @@ func TestServer_LMTP_tooLongMessage(t *testing.T) {
 
 	if len(be.messages) != 0 || len(be.anonmsgs) != 0 {
 		t.Fatal("Invalid number of sent messages:", be.messages, be.anonmsgs)
+	}
+}
+
+func TestServer_LMTP_tooLongMessageNoTerminator(t *testing.T) {
+	_, s, c, scanner := testServerGreetedLMTP(t, func(s *smtp.Server) {
+		s.LMTP = true
+		s.MaxMessageBytes = 50
+	})
+	defer s.Close()
+	defer c.Close()
+
+	sendLHLO(t, scanner, c)
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "DATA\r\n")
+	scanner.Scan()
+
+	// Send more data than the server is willing to drain after rejecting
+	// the message, and never send the <CR><LF>.<CR><LF> terminator. The
+	// server must give up and close the connection instead of waiting for
+	// the terminator forever.
+	go io.WriteString(c, strings.Repeat(strings.Repeat("a", 999)+"\r\n", 300))
+
+	// The server may send its 552 responses before closing; the important
+	// part is that it does not wait for the terminator forever.
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for scanner.Scan() {
+		if !strings.HasPrefix(scanner.Text(), "552 ") {
+			t.Fatal("Unexpected response:", scanner.Text())
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
+			t.Fatal("Server kept the connection open waiting for the terminator")
+		}
 	}
 }
 

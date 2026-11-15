@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"io/ioutil"
 )
 
 type EnhancedCode [3]int
@@ -45,6 +46,23 @@ var ErrDataTooLarge = &SMTPError{
 	Code:         552,
 	EnhancedCode: EnhancedCode{5, 3, 4},
 	Message:      "Maximum message size exceeded",
+}
+
+// maxMessageDrainBytes is the maximum number of bytes the server will read
+// and discard after a message (or a BDAT chunk) has been rejected, while
+// looking for the end of the message. If the end is not reached within
+// this budget, the connection cannot be resynchronized and is closed. This
+// prevents clients from tying up connections by never terminating rejected
+// messages.
+const maxMessageDrainBytes = 64 << 10
+
+// drainMessage discards the remainder of a rejected message or BDAT chunk,
+// reading at most maxMessageDrainBytes bytes from r. It reports whether r
+// was fully consumed within that budget. If not, the connection can no
+// longer be resynchronized and must be closed.
+func drainMessage(r io.Reader) (inSync bool) {
+	n, err := io.Copy(ioutil.Discard, io.LimitReader(r, maxMessageDrainBytes+1))
+	return err == nil && n <= maxMessageDrainBytes
 }
 
 type dataReader struct {

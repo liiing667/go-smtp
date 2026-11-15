@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/textproto"
 	"regexp"
@@ -986,8 +985,14 @@ func (c *Conn) handleData(arg string) {
 	r := newDataReader(c)
 	code, enhancedCode, msg := dataErrorToStatus(c.Session().Data(r))
 	r.limited = false
-	io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
+	// Make sure all the data has been consumed. If the client does not
+	// terminate the message within a bounded amount of data, the
+	// connection cannot be resynchronized and is closed.
+	inSync := drainMessage(r)
 	c.writeResponse(code, enhancedCode, msg)
+	if !inSync {
+		c.Close()
+	}
 }
 
 func (c *Conn) handleBdat(arg string) {
@@ -1020,7 +1025,12 @@ func (c *Conn) handleBdat(arg string) {
 	if !c.fromReceived || len(c.recipients) == 0 {
 		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
 		// The chunk follows the command even when the command is rejected.
-		io.Copy(ioutil.Discard, io.LimitReader(c.text.R, int64(size)))
+		// If the client does not send the whole declared chunk within a
+		// bounded amount of data, the connection cannot be resynchronized
+		// and is closed.
+		if !drainMessage(io.LimitReader(c.text.R, int64(size))) {
+			c.Close()
+		}
 		return
 	}
 
@@ -1028,9 +1038,12 @@ func (c *Conn) handleBdat(arg string) {
 		c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
 
 		// Discard chunk itself without passing it to backend.
-		io.Copy(ioutil.Discard, io.LimitReader(c.text.R, int64(size)))
+		inSync := drainMessage(io.LimitReader(c.text.R, int64(size)))
 
 		c.reset()
+		if !inSync {
+			c.Close()
+		}
 		return
 	}
 
@@ -1084,11 +1097,11 @@ func (c *Conn) handleBdat(arg string) {
 	if err != nil {
 		// Backend might return an error early using CloseWithError without consuming
 		// the whole chunk.
-		io.Copy(ioutil.Discard, chunk)
+		inSync := drainMessage(chunk)
 
 		c.writeResponse(dataErrorToStatus(err))
 
-		if err == errPanic {
+		if err == errPanic || !inSync {
 			c.Close()
 		}
 
@@ -1218,11 +1231,14 @@ func (c *Conn) handleDataLMTP() {
 		// Fallback to using a single status for all recipients.
 		err := c.Session().Data(r)
 		r.limited = false
-		io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
+		// Make sure all the data has been consumed. If the client does
+		// not terminate the message within a bounded amount of data, the
+		// connection cannot be resynchronized and is closed.
+		inSync := drainMessage(r)
 		for _, rcpt := range c.recipients {
 			status.SetStatus(rcpt, err)
 		}
-		done <- true
+		done <- inSync
 	} else {
 		go func() {
 			defer func() {
@@ -1241,8 +1257,11 @@ func (c *Conn) handleDataLMTP() {
 
 			status.fillRemaining(lmtpSession.LMTPData(r, status))
 			r.limited = false
-			io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
-			done <- true
+			// Make sure all the data has been consumed. If the client
+			// does not terminate the message within a bounded amount of
+			// data, the connection cannot be resynchronized and is
+			// closed.
+			done <- drainMessage(r)
 		}()
 	}
 
@@ -1251,8 +1270,8 @@ func (c *Conn) handleDataLMTP() {
 		c.writeResponse(code, enchCode, "<"+rcpt+"> "+msg)
 	}
 
-	// If done gets false, the panic occurred in LMTPData and the connection
-	// should be closed.
+	// If done gets false, the panic occurred in LMTPData or the client did
+	// not terminate its message, and the connection should be closed.
 	if !<-done {
 		c.Close()
 	}
