@@ -836,6 +836,94 @@ func TestServer_tooLongMessage(t *testing.T) {
 	}
 }
 
+// The size limit must be enforced against the number of octets actually
+// received on the wire. Dot-stuffing adds a leading dot per line which is
+// removed before the data reaches the backend, so counting only the
+// dot-unstuffed size would let the client exceed the budget.
+func TestServer_tooLongMessage_dotStuffingWireBytes(t *testing.T) {
+	be, s, c, scanner := testServerAuthenticated(t)
+	defer s.Close()
+
+	// Each body line is sent on the wire with a dot-stuffing leading dot.
+	// The dot-unstuffed payload is 40 bytes but the wire representation is
+	// 45 bytes (five extra leading dots), which exceeds the 42-byte budget.
+	s.MaxMessageBytes = 42
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "DATA\r\n")
+	scanner.Scan()
+
+	io.WriteString(c, "..aaaa\r\n")
+	io.WriteString(c, "..bbbb\r\n")
+	io.WriteString(c, "..cccc\r\n")
+	io.WriteString(c, "..dddd\r\n")
+	io.WriteString(c, "..eeee\r\n")
+	io.WriteString(c, ".\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "552 ") {
+		t.Fatal("Invalid DATA response, expected 552 but got:", scanner.Text())
+	}
+
+	// The over-limit message must never reach the backend.
+	if len(be.messages) != 0 || len(be.anonmsgs) != 0 {
+		t.Fatal("Invalid number of sent messages:", be.messages, be.anonmsgs)
+	}
+
+	// The whole message was drained: the next command has to be parsed
+	// correctly instead of being treated as leftover message data.
+	io.WriteString(c, "NOOP\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid NOOP response after over-limit message:", scanner.Text())
+	}
+}
+
+// A message whose wire size fits within the budget (including dot-stuffing
+// overhead) must still be accepted and delivered dot-unstuffed to the
+// backend, followed by a correctly aligned next command.
+func TestServer_messageSize_dotStuffingAccepted(t *testing.T) {
+	be, s, c, scanner := testServerAuthenticated(t)
+	defer s.Close()
+
+	s.MaxMessageBytes = 45
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "DATA\r\n")
+	scanner.Scan()
+
+	io.WriteString(c, "..aaaa\r\n")
+	io.WriteString(c, "..bbbb\r\n")
+	io.WriteString(c, "..cccc\r\n")
+	io.WriteString(c, "..dddd\r\n")
+	io.WriteString(c, "..eeee\r\n")
+	io.WriteString(c, ".\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid DATA response, expected 250 but got:", scanner.Text())
+	}
+
+	if len(be.messages) != 1 {
+		t.Fatal("Invalid number of sent messages:", len(be.messages))
+	}
+
+	want := ".aaaa\r\n.bbbb\r\n.cccc\r\n.dddd\r\n.eeee\r\n"
+	if got := string(be.messages[0].Data); got != want {
+		t.Fatalf("Invalid mail data: got %q want %q", got, want)
+	}
+
+	io.WriteString(c, "NOOP\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid NOOP response:", scanner.Text())
+	}
+}
+
 // See https://www.postfix.org/smtp-smuggling.html
 func TestServer_smtpSmuggling(t *testing.T) {
 	cases := []struct {
