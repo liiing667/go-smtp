@@ -954,14 +954,14 @@ func TestServer_authParam(t *testing.T) {
 	// Invalid HEXCHAR
 	io.WriteString(c, "MAIL FROM: root@nsa.gov AUTH=<hey+A>\r\n")
 	scanner.Scan()
-	if !strings.HasPrefix(scanner.Text(), "500 ") {
+	if !strings.HasPrefix(scanner.Text(), "501 ") {
 		t.Fatal("Invalid MAIL response:", scanner.Text())
 	}
 
 	// Invalid HEXCHAR
 	io.WriteString(c, "MAIL FROM: root@nsa.gov AUTH=<he+YYa>\r\n")
 	scanner.Scan()
-	if !strings.HasPrefix(scanner.Text(), "500 ") {
+	if !strings.HasPrefix(scanner.Text(), "501 ") {
 		t.Fatal("Invalid MAIL response:", scanner.Text())
 	}
 
@@ -1900,5 +1900,248 @@ func TestServerMTPRIORITY(t *testing.T) {
 	}
 	if *opts.MTPriority != expectedPriority {
 		t.Fatalf("MTPriority: want %d, got %d", expectedPriority, *opts.MTPriority)
+	}
+}
+
+// failClosedBackend wraps the test backend and counts how many times the
+// Session is notified, so tests can assert that parameter-parse failures never
+// reach the backend.
+type failClosedBackend struct {
+	*backend
+	mailCalls int
+	rcptCalls int
+}
+
+func (be *failClosedBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
+	sess, err := be.backend.NewSession(c)
+	if err != nil {
+		return nil, err
+	}
+	return &failClosedSession{Session: sess, backend: be}, nil
+}
+
+type failClosedSession struct {
+	smtp.Session
+	backend *failClosedBackend
+}
+
+func (s *failClosedSession) Mail(from string, opts *smtp.MailOptions) error {
+	s.backend.mailCalls++
+	return s.Session.Mail(from, opts)
+}
+
+func (s *failClosedSession) Rcpt(to string, opts *smtp.RcptOptions) error {
+	s.backend.rcptCalls++
+	return s.Session.Rcpt(to, opts)
+}
+
+func testServerFailClosed(t *testing.T, fn ...serverConfigureFunc) (*failClosedBackend, *smtp.Server, net.Conn, *bufio.Scanner) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	be := &failClosedBackend{backend: new(backend)}
+	s := smtp.NewServer(be)
+	s.Domain = "localhost"
+	s.AllowInsecureAuth = true
+	for _, f := range fn {
+		f(s)
+	}
+
+	go s.Serve(l)
+
+	c, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scanner := bufio.NewScanner(c)
+	scanner.Scan()
+	if scanner.Text() != "220 localhost ESMTP Service Ready" {
+		t.Fatal("Invalid greeting:", scanner.Text())
+	}
+
+	io.WriteString(c, "EHLO localhost\r\n")
+	for scanner.Scan() {
+		if strings.HasPrefix(scanner.Text(), "250 ") {
+			break
+		}
+	}
+
+	return be, s, c, scanner
+}
+
+func TestServerMailParamsFailClosed(t *testing.T) {
+	be, s, c, scanner := testServerFailClosed(t, func(s *smtp.Server) {
+		s.EnableDSN = true
+		s.EnableSMTPUTF8 = true
+	})
+	defer s.Close()
+	defer c.Close()
+
+	badMailParams := []string{
+		"SIZE=1 SIZE=2",       // duplicate parameter
+		"size=1 SIZE=2",       // duplicate, case-insensitive
+		"SMTPUTF8 SMTPUTF8",   // duplicate valueless parameter
+		"RABIIT",              // unknown parameter
+		"SIZE=1 SI\rZE=2",     // bare CR
+		"SIZE\x00=1",          // NUL control character
+		"RET=FULL RET=HDRS",   // conflicting DSN option
+		"ENVID=abc ENVID=def", // duplicate DSN option
+		"SIZE=1=2",            // multiple equals signs
+		"=value",              // empty parameter name
+	}
+	for _, param := range badMailParams {
+		io.WriteString(c, "MAIL FROM:<root@nsa.gov> "+param+"\r\n")
+		if res := readReply(t, scanner); !strings.HasPrefix(res, "501 ") {
+			t.Errorf("MAIL FROM with %q: want 501, got %q", param, res)
+		}
+	}
+
+	// A rejected MAIL must not open a transaction: RCPT is refused and the
+	// backend Session is never touched.
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "502 ") {
+		t.Fatalf("RCPT after failed MAIL: want 502, got %q", res)
+	}
+
+	if be.mailCalls != 0 || be.rcptCalls != 0 {
+		t.Fatalf("backend called despite parse failure: Mail=%d Rcpt=%d", be.mailCalls, be.rcptCalls)
+	}
+	if len(be.anonmsgs) != 0 {
+		t.Fatal("a rejected MAIL left a sender in the backend")
+	}
+
+	// The connection stays usable and a valid MAIL still works.
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov> SIZE=1024 SMTPUTF8 RET=HDRS\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatalf("valid MAIL FROM rejected: %q", res)
+	}
+	if be.mailCalls != 1 {
+		t.Fatalf("Session.Mail calls: want 1, got %d", be.mailCalls)
+	}
+}
+
+func TestServerRcptParamsFailClosed(t *testing.T) {
+	be, s, c, scanner := testServerFailClosed(t, func(s *smtp.Server) {
+		s.EnableDSN = true
+		s.EnableRRVS = true
+	})
+	defer s.Close()
+	defer c.Close()
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("MAIL FROM rejected:", res)
+	}
+
+	io.WriteString(c, "RCPT TO:<good@gchq.gov.uk>\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("valid RCPT TO rejected:", res)
+	}
+
+	badRcptParams := []string{
+		"NOTIFY=NEVER NOTIFY=FAILURE",   // duplicate parameter
+		"notify=NEVER NOTIFY=FAILURE",   // duplicate, case-insensitive
+		"RABIIT",                        // unknown parameter
+		"NOTIFY=NEVER,SUCCESS",          // conflicting DSN option
+		"NOTIFY=",                       // empty NOTIFY value
+		"ORCPT=RFC822;a ORCPT=RFC822;b", // duplicate DSN option
+		"RRVS\x00=2014-04-03T23:01:00Z", // NUL control character
+		"NOTIFY=FAIL\rURE",              // bare CR
+	}
+	for _, param := range badRcptParams {
+		io.WriteString(c, "RCPT TO:<bad@gchq.gov.uk> "+param+"\r\n")
+		if res := readReply(t, scanner); !strings.HasPrefix(res, "501 ") {
+			t.Errorf("RCPT TO with %q: want 501, got %q", param, res)
+		}
+	}
+
+	// Failed RCPT calls never reach the backend and do not touch the accepted
+	// recipient list.
+	if be.rcptCalls != 1 {
+		t.Fatalf("Session.Rcpt calls: want 1, got %d", be.rcptCalls)
+	}
+
+	// A subsequent valid RCPT and the full DATA flow still work, and only the
+	// two accepted recipients reach the backend.
+	io.WriteString(c, "RCPT TO:<other@gchq.gov.uk>\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("valid RCPT TO rejected:", res)
+	}
+
+	io.WriteString(c, "DATA\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "354 ") {
+		t.Fatal("DATA rejected:", res)
+	}
+	io.WriteString(c, "Hey <3\r\n.\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("message rejected:", res)
+	}
+
+	if len(be.anonmsgs) != 1 {
+		t.Fatalf("messages: want 1, got %d", len(be.anonmsgs))
+	}
+	got := be.anonmsgs[0].To
+	want := []string{"good@gchq.gov.uk", "other@gchq.gov.uk"}
+	if len(got) != len(want) {
+		t.Fatalf("recipients: want %v, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("recipients: want %v, got %v", want, got)
+		}
+	}
+}
+
+func TestServerRsetRollsBackTransaction(t *testing.T) {
+	be, s, c, scanner := testServerFailClosed(t, func(s *smtp.Server) {
+		s.EnableBINARYMIME = true
+	})
+	defer s.Close()
+	defer c.Close()
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov> BODY=BINARYMIME\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("MAIL FROM rejected:", res)
+	}
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("RCPT TO rejected:", res)
+	}
+
+	io.WriteString(c, "RSET\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("RSET rejected:", res)
+	}
+
+	// RSET clears the whole transaction: a new RCPT has no MAIL to attach to.
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "502 ") {
+		t.Fatalf("RCPT after RSET: want 502, got %q", res)
+	}
+
+	// RSET also clears BINARYMIME: a plain MAIL followed by DATA must be
+	// accepted again instead of inheriting the pre-reset transfer mode.
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("MAIL FROM after RSET rejected:", res)
+	}
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("RCPT TO after RSET rejected:", res)
+	}
+	io.WriteString(c, "DATA\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "354 ") {
+		t.Fatalf("DATA after RSET: want 354, got %q", res)
+	}
+	io.WriteString(c, "Hey <3\r\n.\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("message rejected:", res)
+	}
+
+	if len(be.anonmsgs) != 1 || len(be.anonmsgs[0].To) != 1 {
+		t.Fatalf("unexpected backend state after RSET: %+v", be.anonmsgs)
 	}
 }

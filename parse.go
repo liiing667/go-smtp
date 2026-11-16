@@ -49,20 +49,50 @@ func parseCmd(line string) (cmd string, arg string, err error) {
 //	" BODY=8BITMIME SIZE=1024 SMTPUTF8"
 //
 // The leading space is mandatory.
+//
+// Parsing is fail-closed: an argument containing a bare CR/LF or any other
+// control character, a parameter appearing more than once, or a malformed
+// key=value pair results in an error instead of silently dropping or
+// overriding previously seen values.
 func parseArgs(s string) (map[string]string, error) {
+	if containsControlChar(s) {
+		return nil, fmt.Errorf("control character in arg string: %q", s)
+	}
+
 	argMap := map[string]string{}
 	for _, arg := range strings.Fields(s) {
-		m := strings.Split(arg, "=")
-		switch len(m) {
-		case 2:
-			argMap[strings.ToUpper(m[0])] = m[1]
-		case 1:
-			argMap[strings.ToUpper(m[0])] = ""
-		default:
+		if strings.Count(arg, "=") > 1 {
 			return nil, fmt.Errorf("failed to parse arg string: %q", arg)
 		}
+		key, value, hasValue := strings.Cut(arg, "=")
+		if key == "" {
+			return nil, fmt.Errorf("failed to parse arg string: %q", arg)
+		}
+
+		key = strings.ToUpper(key)
+		if _, ok := argMap[key]; ok {
+			return nil, fmt.Errorf("duplicate ESMTP parameter: %q", key)
+		}
+
+		if !hasValue {
+			value = ""
+		}
+		argMap[key] = value
 	}
 	return argMap, nil
+}
+
+// containsControlChar reports whether s contains an ASCII control character,
+// including bare CR and LF and the DEL character. ESMTP parameter values use
+// xtext encoding for control characters, so a raw control character is always
+// a protocol violation.
+func containsControlChar(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < ' ' || s[i] == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 func parseHelloArgument(arg string) (string, error) {

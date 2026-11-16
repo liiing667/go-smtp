@@ -86,6 +86,72 @@ func TestServer_LMTP(t *testing.T) {
 	}
 }
 
+func TestServer_LMTPFailClosedParams(t *testing.T) {
+	be, s, c, scanner := testServerGreetedLMTP(t, func(s *smtp.Server) {
+		s.LMTP = true
+		s.EnableDSN = true
+	})
+	defer s.Close()
+	defer c.Close()
+
+	sendLHLO(t, scanner, c)
+
+	// Repeated MAIL parameters are rejected with 501 and open no transaction.
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov> SIZE=1 SIZE=2\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "501 ") {
+		t.Fatalf("duplicate MAIL parameter: want 501, got %q", scanner.Text())
+	}
+
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "502 ") {
+		t.Fatalf("RCPT after failed MAIL: want 502, got %q", scanner.Text())
+	}
+
+	// A valid transaction still works, and a malformed RCPT does not affect
+	// the recipients already accepted on the same LMTP connection.
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("MAIL FROM rejected:", scanner.Text())
+	}
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("valid RCPT TO rejected:", scanner.Text())
+	}
+	io.WriteString(c, "RCPT TO:<root@bnd.bund.de> NOTIFY=NEVER,FAILURE\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "501 ") {
+		t.Fatalf("conflicting NOTIFY: want 501, got %q", scanner.Text())
+	}
+	io.WriteString(c, "RCPT TO:<root@bnd.bund.de>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("valid RCPT TO rejected:", scanner.Text())
+	}
+
+	io.WriteString(c, "DATA\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "354 ") {
+		t.Fatal("DATA rejected:", scanner.Text())
+	}
+	io.WriteString(c, "Hey <3\r\n.\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("first LMTP DATA response:", scanner.Text())
+	}
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("second LMTP DATA response:", scanner.Text())
+	}
+
+	if len(be.anonmsgs) != 1 || len(be.anonmsgs[0].To) != 2 {
+		t.Fatalf("unexpected LMTP transaction state: %+v", be.anonmsgs)
+	}
+}
+
 func TestServer_LMTP_tooLongMessage(t *testing.T) {
 	be, s, c, scanner := testServerGreetedLMTP(t, func(s *smtp.Server) {
 		s.LMTP = true

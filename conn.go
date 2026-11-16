@@ -419,7 +419,7 @@ func (c *Conn) handleMail(arg string) {
 		case "AUTH":
 			value, err := decodeXtext(value)
 			if err != nil || value == "" {
-				c.writeResponse(500, EnhancedCode{5, 5, 4}, "Malformed AUTH parameter value")
+				c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed AUTH parameter value")
 				return
 			}
 			if value == "<>" {
@@ -428,7 +428,7 @@ func (c *Conn) handleMail(arg string) {
 				p := parser{s: value}
 				value, err = p.parseMailbox()
 				if err != nil || p.s != "" {
-					c.writeResponse(500, EnhancedCode{5, 5, 4}, "Malformed AUTH parameter mailbox")
+					c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed AUTH parameter mailbox")
 					return
 				}
 			}
@@ -466,7 +466,7 @@ func (c *Conn) handleMail(arg string) {
 			}
 			opts.MTPriority = &mtPriority
 		default:
-			c.writeResponse(500, EnhancedCode{5, 5, 4}, "Unknown MAIL FROM argument")
+			c.writeResponse(501, EnhancedCode{5, 5, 4}, "Unknown MAIL FROM argument")
 			return
 		}
 	}
@@ -778,7 +778,7 @@ func (c *Conn) handleRcpt(arg string) {
 			}
 			opts.RequireRecipientValidSince = rrvsTime
 		default:
-			c.writeResponse(500, EnhancedCode{5, 5, 4}, "Unknown RCPT TO argument")
+			c.writeResponse(501, EnhancedCode{5, 5, 4}, "Unknown RCPT TO argument")
 			return
 		}
 	}
@@ -1349,6 +1349,7 @@ func (c *Conn) reset() {
 		c.session.Reset()
 	}
 
+	c.binarymime = false
 	c.fromReceived = false
 	c.recipients = nil
 }
